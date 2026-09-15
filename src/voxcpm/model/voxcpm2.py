@@ -1141,6 +1141,7 @@ class VoxCPM2Model(nn.Module):
     ):
         with open(os.path.join(path, "config.json"), "r", encoding="utf-8") as _cfg_f:
             config = VoxCPMConfig.model_validate_json(_cfg_f.read())
+        runtime_device = resolve_runtime_device(device, config.device)
         tokenizer = LlamaTokenizerFast.from_pretrained(path)
         audio_vae_config = getattr(config, "audio_vae_config", None)
         audio_vae = AudioVAEV2(config=audio_vae_config) if audio_vae_config else AudioVAEV2()
@@ -1149,12 +1150,12 @@ class VoxCPM2Model(nn.Module):
         audiovae_pth_path = os.path.join(path, "audiovae.pth")
         if os.path.exists(audiovae_safetensors_path) and SAFETENSORS_AVAILABLE:
             print(f"Loading AudioVAE from safetensors: {audiovae_safetensors_path}", file=sys.stderr)
-            vae_state_dict = load_file(audiovae_safetensors_path, device="cpu")
+            vae_state_dict = load_file(audiovae_safetensors_path, device=runtime_device)
         elif os.path.exists(audiovae_pth_path):
             print(f"Loading AudioVAE from pytorch: {audiovae_pth_path}", file=sys.stderr)
             checkpoint = torch.load(
                 audiovae_pth_path,
-                map_location="cpu",
+                map_location=runtime_device,
                 weights_only=True,
             )
             vae_state_dict = checkpoint.get("state_dict", checkpoint)
@@ -1162,7 +1163,7 @@ class VoxCPM2Model(nn.Module):
             raise FileNotFoundError(
                 f"AudioVAE checkpoint not found. Expected either {audiovae_safetensors_path} or {audiovae_pth_path}"
             )
-        model = cls(config, tokenizer, audio_vae, lora_config, device=device)
+        model = cls(config, tokenizer, audio_vae, lora_config, device=runtime_device)
         if not training:
             lm_dtype = get_dtype(model.config.dtype)
             model = model.to(lm_dtype)
@@ -1175,6 +1176,7 @@ class VoxCPM2Model(nn.Module):
                     if "lora" not in name:  # freeze non-LoRA weights
                         param.requires_grad = False
         model.audio_vae = model.audio_vae.to(torch.float32)
+        model = model.to(model.device)
 
         # Try to load from safetensors first, fallback to pytorch_model.bin
         safetensors_path = os.path.join(path, "model.safetensors")
@@ -1182,12 +1184,12 @@ class VoxCPM2Model(nn.Module):
 
         if os.path.exists(safetensors_path) and SAFETENSORS_AVAILABLE:
             print(f"Loading model from safetensors: {safetensors_path}", file=sys.stderr)
-            model_state_dict = load_file(safetensors_path)
+            model_state_dict = load_file(safetensors_path, device=model.device)
         elif os.path.exists(pytorch_model_path):
             print(f"Loading model from pytorch_model.bin: {pytorch_model_path}", file=sys.stderr)
             checkpoint = torch.load(
                 pytorch_model_path,
-                map_location="cpu",
+                map_location=model.device,
                 weights_only=True,
             )
             model_state_dict = checkpoint.get("state_dict", checkpoint)
@@ -1196,10 +1198,12 @@ class VoxCPM2Model(nn.Module):
 
         for kw, val in vae_state_dict.items():
             model_state_dict[f"audio_vae.{kw}"] = val
+        del vae_state_dict
 
         # LoRALinear keeps weight/bias compatible with nn.Linear but adds
         # lora_A/lora_B, which are absent from base pretrained checkpoints.
         model.load_state_dict(model_state_dict, strict=False)
+        del model_state_dict
         if training:
             return model
         return model.to(model.device).eval().optimize(disable=not optimize)
